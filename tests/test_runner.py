@@ -14,7 +14,8 @@ from aegis_alpha.runner import (
     subscription_levels,
     subscription_symbols,
 )
-from aegis_alpha.models import RealtimeConnectionStatus
+from aegis_alpha.models import RealtimeConnectionStatus, RunnerStatus
+from aegis_alpha.storage import write_runner_status
 
 
 def test_runner_config_defaults(monkeypatch) -> None:
@@ -48,6 +49,23 @@ trading_sessions: []
 
     assert payload["state"] == "STOPPED"
     assert payload["notes"]
+
+
+def test_runner_status_payload_resolves_relative_path_from_project_root(tmp_path, monkeypatch) -> None:
+    project_root = tmp_path / "project"
+    status_path = project_root / "data" / "runner_status.json"
+    config_path = tmp_path / "runner.yaml"
+    config_path.write_text("storage:\n  status_path: data/runner_status.json\n")
+    write_runner_status(
+        RunnerStatus(state="RUNNING", updated_at="2026-06-24T10:00:00+08:00"),
+        status_path,
+    )
+    monkeypatch.setenv("AEGIS_ALPHA_PROJECT_ROOT", str(project_root))
+    monkeypatch.chdir(tmp_path)
+
+    payload = status_payload(str(config_path))
+
+    assert payload["state"] == "RUNNING"
 
 
 def test_reconnect_delay_uses_exponential_backoff_with_jitter() -> None:
@@ -93,6 +111,27 @@ def test_realtime_feed_health_marks_stale_messages() -> None:
     )
 
     assert error == "stale_realtime_messages_after_181s"
+
+
+def test_realtime_feed_health_graces_message_from_previous_connection() -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    connection = RealtimeConnectionStatus(
+        provider="jvQuant",
+        connected=True,
+        last_message_at="2026-06-24T11:30:15+08:00",
+    )
+
+    error = realtime_feed_health_error(
+        {
+            "stale_after_seconds": 180,
+            "realtime_no_message_grace_seconds": 180,
+        },
+        connection,
+        connected_at="2026-06-24T13:00:09+08:00",
+        now=datetime(2026, 6, 24, 13, 0, 10, tzinfo=tz),
+    )
+
+    assert error == ""
 
 
 def test_runner_persists_buffer_outputs(tmp_path) -> None:
@@ -214,6 +253,122 @@ storage:
     assert runner._runtime_symbols == ["600000", "000001", "002281"]
     assert fake_client.calls[0] == ["600000"]
     assert fake_client.calls[1] == ["000001", "002281"]
+
+
+def test_discovered_symbols_use_lv1_only_while_base_keeps_paid_levels(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("JVQUANT_SUBSCRIBE_SYMBOLS", "600000")
+    config_path = tmp_path / "runner.yaml"
+    config_path.write_text(
+        f"""
+market: ab
+trading_sessions:
+  - name: all_day
+    start: "00:00"
+    end: "23:59"
+subscription:
+  default_symbols: ["600000"]
+  levels: ["lv1", "lv2", "lv10"]
+realtime_discovery:
+  enabled: true
+  max_symbols: 5
+  subscription_levels: ["lv1"]
+paid_depth_promotion:
+  enabled: true
+  max_symbols: 2
+  levels: ["lv2", "lv10"]
+storage:
+  sqlite_path: "{tmp_path / 'runner.db'}"
+  status_path: "{tmp_path / 'runner_status.json'}"
+""".strip()
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.connected = False
+            self.calls: list[tuple[list[str], list[str]]] = []
+
+        def status(self) -> RealtimeConnectionStatus:
+            return RealtimeConnectionStatus(provider="jvQuant", connected=self.connected)
+
+        def subscribe(self, symbols: list[str], levels: list[str]) -> RealtimeConnectionStatus:
+            self.connected = True
+            self.calls.append((list(symbols), list(levels)))
+            return self.status()
+
+        def disconnect(self) -> RealtimeConnectionStatus:
+            self.connected = False
+            return self.status()
+
+    class FakeAdapter:
+        def _query(self, query: str, sort_key: str = "") -> dict:
+            return {"data": {"fields": ["股票代码", "股票简称", "行业"], "list": [["002491", "通鼎互联", "通信设备"]]}}
+
+        def get_limitup_pool(self) -> list:
+            return [SimpleNamespace(symbol="600105", name="永鼎股份", theme="通信设备")]
+
+        def get_theme_leaders(self, theme: str, trading_day: str) -> list:
+            return []
+
+    monkeypatch.setattr("aegis_alpha.runner.create_market_data_adapter", lambda: FakeAdapter())
+    runner = AegisAlphaRunner(str(config_path), connect=True)
+    fake_client = FakeClient()
+    runner.client = fake_client  # type: ignore[assignment]
+
+    runner.run_once()
+
+    assert fake_client.calls[0] == (["600000"], ["lv1", "lv2", "lv10"])
+    assert fake_client.calls[1] == (["002491", "600105"], ["lv1"])
+    assert fake_client.calls[2] == (["002491", "600105"], ["lv2", "lv10"])
+    assert runner._symbol_metadata["002491"]["name"] == "通鼎互联"
+    assert runner._symbol_metadata["600105"]["theme"] == "通信设备"
+
+
+def test_high_confidence_candidate_creates_one_investigation_alert_per_symbol_day(tmp_path) -> None:
+    from aegis_alpha.models import MarketEvent
+
+    config_path = tmp_path / "runner.yaml"
+    config_path.write_text(
+        f"""
+subscription:
+  default_symbols: ["002491"]
+  levels: ["lv1"]
+candidate_investigation:
+  enabled: true
+  min_score: 75
+storage:
+  sqlite_path: "{tmp_path / 'runner.db'}"
+  status_path: "{tmp_path / 'runner_status.json'}"
+""".strip()
+    )
+    runner = AegisAlphaRunner(str(config_path), connect=False)
+
+    def event(event_id: str, score: float) -> MarketEvent:
+        return MarketEvent(
+            event_id=event_id,
+            event_type="SECOND_BOARD_CANDIDATE_REPRICE",
+            symbol="002491",
+            name="通鼎互联",
+            theme="通信设备",
+            confidence="high",
+            score=score,
+            evidence=["candidate current change is 10.01%."],
+            provider_timestamp="2026-06-24T11:14:00+08:00",
+            received_at="2026-06-24T11:14:00+08:00",
+            freshness_status="fresh",
+            suggested_agent_action=[],
+            data={},
+        )
+
+    runner._maybe_alert_from_events([event("low", 74.99)])
+    runner._maybe_alert_from_events([event("high-1", 75.03)])
+    runner._maybe_alert_from_events([event("high-2", 80.0)])
+
+    alerts = runner.store.list_alerts(status="pending", limit=20)
+    candidate_alerts = [a for a in alerts if a.title == "CANDIDATE_INVESTIGATION 002491"]
+    assert len(candidate_alerts) == 1
+    assert candidate_alerts[0].event_id == "candidate-investigation:2026-06-24:002491"
 
 
 def test_persist_buffer_outputs_appends_sector_events_when_leader_breaks(tmp_path, monkeypatch):
@@ -342,6 +497,9 @@ storage:
     assert len(triggered) == 3, (
         f"all 3 P6 event types should trigger notify_macos; got titles: {triggered}"
     )
+
+    runner._maybe_alert_from_events(events)
+    assert len(triggered) == 3, "persisted event alerts must not be delivered twice"
 
 
 def test_collect_sector_events_preserves_partial_results_when_one_detector_fails(

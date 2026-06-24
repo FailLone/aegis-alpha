@@ -3,16 +3,16 @@
 # Do not put API keys in this file; use ~/.hermes/.env.
 
 model:
-  provider: "openrouter"
-  default: "anthropic/claude-opus-4.7"
-  base_url: "https://openrouter.ai/api/v1"
+  provider: "deepseek"
+  default: "deepseek-v4-pro"
+  base_url: ""
   api_mode: "chat_completions"
 
 providers: {}
 
 fallback_providers:
-  - provider: "deepseek"
-    model: "deepseek-v4-pro"
+  - provider: "openrouter"
+    model: "openai/gpt-5.4"
 
 credential_pool_strategies: {}
 

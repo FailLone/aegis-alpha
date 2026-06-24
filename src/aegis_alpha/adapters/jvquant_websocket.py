@@ -5,6 +5,10 @@ import os
 import re
 from typing import Any
 
+from aegis_alpha.alerts.provider_health import (
+    classify_provider_error,
+    record_provider_failure,
+)
 from aegis_alpha.events import SignalWindowBuffer, now_iso
 from aegis_alpha.models import RealtimeConnectionStatus
 from aegis_alpha.signals.orderbook import estimate_from_lv10_object
@@ -119,6 +123,11 @@ class JvQuantRealtimeClient:
     def connect(self) -> RealtimeConnectionStatus:
         if not self.token:
             self._last_error = "JVQUANT_TOKEN missing"
+            record_provider_failure(
+                provider="jvQuant",
+                component="websocket_connect",
+                error=self._last_error,
+            )
             return self.status()
         try:
             from jvQuant import websocket_client
@@ -134,9 +143,16 @@ class JvQuantRealtimeClient:
                 ab_lv10_handle=self._on_ab_lv10,
             )
             self._connected = True
+            self._last_error = ""
         except Exception as exc:
             self._connected = False
-            self._last_error = type(exc).__name__
+            error = str(exc) or type(exc).__name__
+            self._last_error = error if classify_provider_error(error) else type(exc).__name__
+            record_provider_failure(
+                provider="jvQuant",
+                component="websocket_connect",
+                error=error,
+            )
         return self.status()
 
     def subscribe(self, symbols: list[str], levels: list[str] | None = None) -> RealtimeConnectionStatus:
@@ -155,7 +171,13 @@ class JvQuantRealtimeClient:
                 self._client.add_lv10(clean_symbols)
             self._subscribed.update(subscription_codes(clean_symbols, clean_levels))
         except Exception as exc:
-            self._last_error = type(exc).__name__
+            error = str(exc) or type(exc).__name__
+            self._last_error = error if classify_provider_error(error) else type(exc).__name__
+            record_provider_failure(
+                provider="jvQuant",
+                component="websocket_subscribe",
+                error=error,
+            )
         return self.status()
 
     def unsubscribe(self, symbols: list[str], levels: list[str] | None = None) -> RealtimeConnectionStatus:
@@ -176,12 +198,16 @@ class JvQuantRealtimeClient:
         return self.status()
 
     def disconnect(self) -> RealtimeConnectionStatus:
-        if self._client is not None:
+        client = self._client
+        self._client = None
+        if client is not None:
             try:
-                self._client.disconnect()
+                client.disconnect()
             except Exception as exc:
                 self._last_error = type(exc).__name__
         self._connected = False
+        self._subscribed.clear()
+        self._last_message_at = ""
         return self.status()
 
     def status(self) -> RealtimeConnectionStatus:
@@ -199,11 +225,21 @@ class JvQuantRealtimeClient:
         )
 
     def _on_log(self, message: str) -> None:
-        text = str(message or "").lower()
+        raw = str(message or "").strip()
+        text = raw.lower()
+        category = classify_provider_error(raw)
+        if category:
+            self._last_error = raw[:500]
+            record_provider_failure(
+                provider="jvQuant",
+                component="websocket_log",
+                error=raw,
+            )
+            return
         if any(marker in text for marker in ("lost", "goodbye", "closed", "disconnect")):
             self._connected = False
             self._last_error = "provider_connection_lost"
-        elif "error" in text or "失败" in str(message or ""):
+        elif "error" in text or "失败" in raw:
             self._last_error = "provider_log_error"
 
     def _on_raw_data(self, text: str) -> None:

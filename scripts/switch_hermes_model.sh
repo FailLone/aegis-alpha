@@ -13,7 +13,7 @@ Usage:
 
 Modes:
   deepseek    Default automation mode. Uses DeepSeek direct.
-  openrouter  Strong-model mode. Uses OpenRouter Claude Opus.
+  openrouter  Strong-model mode. Uses OpenRouter GPT-5.4.
 USAGE
 }
 
@@ -23,12 +23,14 @@ case "$MODE" in
     hermes config set model.default deepseek-v4-pro
     hermes config set model.base_url ""
     hermes config set model.api_mode chat_completions
+    hermes config set fallback_providers '[{"provider":"openrouter","model":"openai/gpt-5.4"}]'
     ;;
   openrouter)
     hermes config set model.provider openrouter
-    hermes config set model.default anthropic/claude-opus-4.7
+    hermes config set model.default openai/gpt-5.4
     hermes config set model.base_url https://openrouter.ai/api/v1
     hermes config set model.api_mode chat_completions
+    hermes config set fallback_providers '[{"provider":"deepseek","model":"deepseek-v4-pro"}]'
     ;;
   -h|--help|"")
     usage

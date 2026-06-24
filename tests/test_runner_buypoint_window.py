@@ -258,12 +258,27 @@ class TestInsideWindowFiring:
         )
 
 
+def test_reference_candidates_are_cached_between_runner_cycles(tmp_path, monkeypatch):
+    runner = _make_runner(tmp_path)
+    candidate = MagicMock(symbol="000001", previous_high_price=10.0)
+    adapter = MagicMock()
+    adapter.get_second_board_candidates.return_value = [candidate]
+    runner._sector_events_adapter = adapter
+
+    first = runner._reference_candidates_for_buypoints()
+    second = runner._reference_candidates_for_buypoints()
+
+    assert first == [candidate]
+    assert second == [candidate]
+    assert adapter.get_second_board_candidates.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # CHANGE B: dedup — second call with identical data → still only one alert
 # ---------------------------------------------------------------------------
 
 class TestDedup:
-    def test_dedup_second_call_no_duplicate_alert(self, tmp_path, monkeypatch):
+    def test_dedup_second_call_no_duplicate_alert_or_delivery(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path)
         _seed_firing_pattern(runner)
         monkeypatch.setattr("aegis_alpha.runner.now_dt", lambda: _make_dt("09:40"))
@@ -271,6 +286,11 @@ class TestDedup:
             "aegis_alpha.runner.create_market_data_adapter",
             lambda: _make_empty_adapter(),
             raising=False,
+        )
+        delivered: list[str] = []
+        monkeypatch.setattr(
+            "aegis_alpha.alerts.weclaw_notifier.post_alert_to_weclaw",
+            lambda alert, _config: delivered.append(alert.event_id) or True,
         )
 
         runner.detect_buypoints_in_window(["000001"])
@@ -282,6 +302,23 @@ class TestDedup:
         assert len(bp_alerts) == 1, (
             f"Dedup failed: expected 1 alert after 2 calls, got {len(bp_alerts)}"
         )
+        assert delivered == ["buypoint:000001:09:37"]
+
+    def test_historical_replay_trigger_is_not_delivered(self, tmp_path, monkeypatch):
+        runner = _make_runner(tmp_path)
+        _seed_firing_pattern(runner)
+        runner.buffer.add_price(
+            "000001", "2026-06-12T09:38:30+08:00", 10.08, 850.0
+        )
+        monkeypatch.setattr("aegis_alpha.runner.now_dt", lambda: _make_dt("09:40"))
+        monkeypatch.setattr(
+            "aegis_alpha.runner.create_market_data_adapter",
+            lambda: _make_empty_adapter(),
+            raising=False,
+        )
+
+        assert runner.detect_buypoints_in_window(["000001"]) == []
+        assert AlertStore(runner.store).list_recent(limit=50) == []
 
 
 # ---------------------------------------------------------------------------

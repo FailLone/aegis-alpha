@@ -134,3 +134,46 @@ def test_record_reject_stance_suppresses(monkeypatch, tmp_path):
         evidence_json=json.dumps(["e"]), data_gaps_json=json.dumps(["g"]), summary="s",
     )
     assert rec["notification_grade"] == "suppress"
+
+
+def test_record_normalizes_unknown_source_without_alert_to_periodic_scan(monkeypatch, tmp_path):
+    _store(monkeypatch, tmp_path)
+    rec = server.record_agent_observation(
+        trading_day="2026-06-23",
+        title="周期观察",
+        summary="有事实",
+        source="cron_observer",
+        evidence_json=json.dumps(["e"]),
+        data_gaps_json=json.dumps(["g"]),
+    )
+    assert rec["source"] == "periodic_market_scan"
+
+
+def test_record_normalizes_unknown_source_with_alert_to_trigger_enrichment(monkeypatch, tmp_path):
+    _store(monkeypatch, tmp_path)
+    rec = server.record_agent_observation(
+        trading_day="2026-06-23",
+        title="告警增强",
+        summary="有事实",
+        source="webhook_alert",
+        linked_alert_ids_json=json.dumps(["alert-1"]),
+        evidence_json=json.dumps(["e"]),
+        data_gaps_json=json.dumps(["g"]),
+    )
+    assert rec["source"] == "trigger_enrichment"
+
+
+def test_record_normalizes_unknown_observation_type_from_stance(monkeypatch, tmp_path):
+    _store(monkeypatch, tmp_path)
+    rec = server.record_agent_observation(
+        trading_day="2026-06-23",
+        title="封单风险",
+        summary="封单快速衰减",
+        observation_type="break_board_risk",
+        stance="reject",
+        evidence_json=json.dumps(["e"]),
+        data_gaps_json=json.dumps(["g"]),
+    )
+    assert rec["observation_type"] == "noise_or_rejected_trigger"
+    assert rec["notification_grade"] == "suppress"
+    assert any("observation_type normalized" in note for note in rec["input_normalizations"])

@@ -33,6 +33,16 @@ Next work:
 
 - Validate jvQuant WebSocket subscription during a live trading session.
 - Confirm real `BUYPOINT_ALERT` and `SELECTION_VALIDATION` events flow from runner to Hermes webhook.
+- `BUYPOINT_ALERT` is agent input, not a direct WeClaw message. WeClaw receives
+  only agent observations graded `urgent` or `important`, plus low-frequency
+  `SELECTION_VALIDATION` audit messages.
+- Provider failures are a separate operational channel. Every five minutes, a
+  no-agent health job checks Hermes cron failures, runner status, and recorded
+  jvQuant query/WebSocket errors. It also incrementally reads Hermes Gateway
+  provider errors, so a primary-model balance failure is reported even when a
+  fallback model completes the task successfully. Balance, quota, entitlement,
+  and rate-limit failures bypass market-signal grading and notify WeClaw
+  directly, with a six-hour duplicate cooldown.
 - Confirm useful `AgentObservation` quality over several live sessions and tune only the skill wording if the agent is too noisy or too timid.
 - Add provider-paid data only if the local MVP shows useful signal quality.
 
@@ -66,13 +76,14 @@ Default automation mode is DeepSeek direct:
 scripts/switch_hermes_model.sh deepseek
 ```
 
-Use OpenRouter strong-model mode when a harder review needs Claude Opus:
+DeepSeek mode keeps OpenRouter GPT-5.4 as the billing/rate-limit fallback.
+Use OpenRouter as the primary model when a harder review needs it:
 
 ```bash
 scripts/switch_hermes_model.sh openrouter
 ```
 
-Do not mix `model.provider=deepseek` with `model.base_url=https://openrouter.ai/api/v1`; that sends DeepSeek requests through the wrong endpoint and fails authentication. The switch script updates provider, model, base URL, API mode, and restarts Hermes gateway.
+Do not mix `model.provider=deepseek` with `model.base_url=https://openrouter.ai/api/v1`; that sends DeepSeek requests through the wrong endpoint and fails authentication. The switch script updates provider, model, base URL, fallback chain, API mode, and restarts Hermes gateway.
 
 ## Daily Prepare Job
 
@@ -145,7 +156,7 @@ HERMES_AEGIS_WEBHOOK_SECRET=...
 Hermes cron runs the morning report after the opening window:
 
 ```text
-5 10 * * 1-5  aegis-alpha-morning-report
+30 10 * * 1-5  aegis-alpha-morning-report
 ```
 
 The cron job injects context from:
@@ -180,6 +191,11 @@ The cron job injects context from:
 ```bash
 ~/.hermes/scripts/aegis_alpha_market_observer_context.sh
 ```
+
+Observer jobs run with the `aegisobserver` Hermes profile. The installer copies
+the context scripts into that profile and applies a shorter agent budget. This
+keeps observer prompts lighter while preserving the same MCP facts and
+deterministic notification gate.
 
 Hermes should then:
 

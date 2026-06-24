@@ -2347,14 +2347,52 @@ def record_agent_observation(
             return []
         return [str(x) for x in parsed] if isinstance(parsed, list) else []
 
+    linked_alert_ids = _list(linked_alert_ids_json)
+    input_normalizations: list[str] = []
+    allowed_sources = {
+        "trigger_enrichment",
+        "periodic_market_scan",
+        "manual_wechat_query",
+        "post_close_review",
+    }
+    normalized_source = source.strip()
+    if normalized_source not in allowed_sources:
+        original_source = normalized_source
+        normalized_source = "trigger_enrichment" if linked_alert_ids else "periodic_market_scan"
+        input_normalizations.append(
+            f"source normalized from {original_source or '<empty>'} to {normalized_source}"
+        )
+    allowed_observation_types = {
+        "buy_point_quality",
+        "watchlist_observation",
+        "market_regime_shift",
+        "theme_rotation",
+        "strong_continuation_without_buy_point",
+        "data_gap",
+        "noise_or_rejected_trigger",
+    }
+    normalized_observation_type = observation_type.strip()
+    if normalized_observation_type not in allowed_observation_types:
+        original_type = normalized_observation_type
+        if stance == "reject":
+            normalized_observation_type = "noise_or_rejected_trigger"
+        elif stance == "insufficient_data":
+            normalized_observation_type = "data_gap"
+        else:
+            normalized_observation_type = "watchlist_observation"
+        input_normalizations.append(
+            "observation_type normalized from "
+            f"{original_type or '<empty>'} to {normalized_observation_type}"
+        )
+
     observation = AgentObservation(
         observation_id=compute_observation_id(
-            trading_day=trading_day, source=source,
-            observation_type=observation_type, symbol=symbol, theme=theme,
+            trading_day=trading_day, source=normalized_source,
+            observation_type=normalized_observation_type, symbol=symbol, theme=theme,
         ),
         trading_day=trading_day,
-        source=source,
-        observation_type=observation_type,
+        source=normalized_source,
+        observation_type=normalized_observation_type,
         symbol=symbol,
         theme=theme,
         title=title,
@@ -2365,7 +2403,7 @@ def record_agent_observation(
         counter_evidence=_list(counter_evidence_json),
         data_gaps=_list(data_gaps_json),
         linked_event_ids=_list(linked_event_ids_json),
-        linked_alert_ids=_list(linked_alert_ids_json),
+        linked_alert_ids=linked_alert_ids,
         expires_at=expires_at,
         provider=provider,
         model=model,
@@ -2388,6 +2426,8 @@ def record_agent_observation(
             result["observation_quality_warnings"] = quality_warnings
         else:
             result["observation_quality"] = "ok"
+        if input_normalizations:
+            result["input_normalizations"] = input_normalizations
         return result
 
     return _call_store(_run)
@@ -2555,7 +2595,7 @@ def get_realtime_symbol_context(symbol: str, lookback_minutes: int = 30) -> dict
         events = [
             e for e in all_events
             if str(getattr(e, "symbol", "")).split(".")[0] == sym_key
-        ][:20]
+        ][:8]
         data_gaps: list[str] = []
         if snapshot is None:
             data_gaps.append("无该标的结构化快照;盘中价格/涨速/大单代理不可用。")
@@ -2566,7 +2606,22 @@ def get_realtime_symbol_context(symbol: str, lookback_minutes: int = 30) -> dict
             "symbol": safe_symbol,
             "lookback_minutes": safe_lookback,
             "snapshot": snapshot.model_dump() if snapshot is not None else None,
-            "recent_events": [e.model_dump() for e in events],
+            "recent_events": [
+                {
+                    "event_id": e.event_id,
+                    "event_type": e.event_type,
+                    "symbol": e.symbol,
+                    "name": e.name,
+                    "theme": e.theme,
+                    "confidence": e.confidence,
+                    "score": e.score,
+                    "evidence": list(e.evidence[:3]),
+                    "provider_timestamp": e.provider_timestamp,
+                    "received_at": e.received_at,
+                    "freshness_status": e.freshness_status,
+                }
+                for e in events
+            ],
             "recent_event_count": len(events),
             "freshness": _freshness_label(events, snapshot),
             "data_gaps": data_gaps,

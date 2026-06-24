@@ -44,4 +44,6 @@ def test_discover_realtime_symbols_merges_current_provider_facts() -> None:
     assert result.source_counts["base"] == 2
     assert result.source_counts["current_large_turnover"] == 2
     assert result.source_counts["current_limitup"] == 2
+    assert result.symbol_metadata["600519"] == {"name": "贵州茅台", "theme": "unknown"}
+    assert result.symbol_metadata["002281"] == {"name": "unknown", "theme": "unknown"}
     assert result.errors == []

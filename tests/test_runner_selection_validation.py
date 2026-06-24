@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+from aegis_alpha.alerts.store import AlertStore
+from aegis_alpha.clock import now_dt
 from aegis_alpha.runner import AegisAlphaRunner
 
 
@@ -47,3 +51,37 @@ selection_validation:
     # empty store → no prior audit → returns [] without exception
     result = r.validate_selections_next_day()
     assert result == []
+
+
+def test_validation_does_not_resend_existing_alert(tmp_path, monkeypatch):
+    config_path = tmp_path / "runner.yaml"
+    config_path.write_text(
+        f"""
+storage:
+  sqlite_path: "{tmp_path / 'runner.db'}"
+  status_path: "{tmp_path / 'status.json'}"
+selection_validation:
+  enabled: true
+  after: "00:00"
+""".strip()
+    )
+    runner = AegisAlphaRunner(str(config_path), connect=False)
+    today = now_dt().date().isoformat()
+    as_of = "2026-06-23"
+    event_id = f"selection_validation:{as_of}:{today}"
+    AlertStore(runner.store).create(title="SELECTION_VALIDATION existing", event_id=event_id)
+    monkeypatch.setattr(
+        runner,
+        "_latest_prior_selection_audit",
+        lambda _today: SimpleNamespace(as_of_day=as_of),
+    )
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("existing validation must not be recomputed or resent")
+
+    monkeypatch.setattr(
+        "aegis_alpha.mcp.server.get_selection_trigger_validation",
+        fail_if_called,
+    )
+
+    assert runner.validate_selections_next_day() == []

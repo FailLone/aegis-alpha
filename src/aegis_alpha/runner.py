@@ -84,6 +84,18 @@ def subscription_levels(config: dict) -> list[str]:
     return [str(item).strip().lower() for item in config.get("subscription", {}).get("levels", ["lv1", "lv2", "lv10"])]
 
 
+def discovery_subscription_levels(config: dict) -> list[str]:
+    configured = config.get("realtime_discovery", {}).get("subscription_levels", ["lv1"])
+    levels = [str(item).strip().lower() for item in configured]
+    return [level for level in levels if level in {"lv1", "lv2", "lv10"}] or ["lv1"]
+
+
+def promoted_subscription_levels(config: dict) -> list[str]:
+    configured = config.get("paid_depth_promotion", {}).get("levels", ["lv2", "lv10"])
+    levels = [str(item).strip().lower() for item in configured]
+    return [level for level in levels if level in {"lv2", "lv10"}]
+
+
 def reconnect_delay_seconds(config: dict, failure_count: int, *, jitter: float | None = None) -> float:
     base = max(1.0, float(config.get("reconnect_interval_seconds") or 30))
     cap = max(base, float(config.get("reconnect_max_interval_seconds") or 300))
@@ -123,9 +135,11 @@ def realtime_feed_health_error(
         int(config.get("realtime_no_message_grace_seconds") or stale_after),
     )
 
+    connected_since = _parse_iso_datetime(connected_at)
     last_message_at = _parse_iso_datetime(connection.last_message_at)
-    if last_message_at is None:
-        connected_since = _parse_iso_datetime(connected_at)
+    if last_message_at is None or (
+        connected_since is not None and last_message_at < connected_since
+    ):
         if connected_since is None:
             return ""
         age_seconds = (current - connected_since).total_seconds()
@@ -246,6 +260,10 @@ class AegisAlphaRunner:
         self._last_discovery_notes: list[str] = []
         self._last_discovery_errors: list[str] = []
         self._last_discovery_source_counts: dict[str, int] = {}
+        self._symbol_metadata: dict[str, dict[str, str]] = {}
+        self._paid_depth_symbols: list[str] = []
+        self._reference_candidates: list = []
+        self._reference_candidates_loaded_at = 0.0
 
     def request_stop(self, *_args: object) -> None:
         self.stop_requested = True
@@ -304,7 +322,29 @@ class AegisAlphaRunner:
             if not connection.connected:
                 self._feed_connected_at = ""
                 self.write_status("STARTING", next_action="connect_websocket")
-                connection = self.client.subscribe(symbols, levels)
+                base_symbols = merge_symbols(
+                    subscription_symbols(self.config),
+                    cap=self._runtime_symbol_cap(),
+                )
+                connection = self.client.subscribe(base_symbols, levels)
+                discovered_symbols = [
+                    symbol for symbol in symbols if symbol not in set(base_symbols)
+                ]
+                if discovered_symbols and connection.connected:
+                    connection = self.client.subscribe(
+                        discovered_symbols,
+                        discovery_subscription_levels(self.config),
+                    )
+                    promoted = [
+                        symbol
+                        for symbol in discovered_symbols
+                        if symbol in set(self._paid_depth_symbols)
+                    ]
+                    if promoted:
+                        connection = self.client.subscribe(
+                            promoted,
+                            promoted_subscription_levels(self.config),
+                        )
             if connection.connected and not self._feed_connected_at:
                 self._feed_connected_at = now_iso()
             health_error = realtime_feed_health_error(
@@ -391,23 +431,62 @@ class AegisAlphaRunner:
             new_symbols = [symbol for symbol in self._runtime_symbols if symbol not in previous]
             self._last_discovery_source_counts = result.source_counts
             self._last_discovery_errors = result.errors
+            self._symbol_metadata.update(result.symbol_metadata)
+            newly_promoted = self._promote_paid_depth_symbols(
+                result.discovered_symbols,
+            )
             self._last_discovery_notes = [
                 f"realtime_discovery_new_symbols={len(new_symbols)}",
                 f"realtime_discovery_total_symbols={len(self._runtime_symbols)}",
+                f"realtime_discovery_levels={discovery_subscription_levels(self.config)}",
+                f"paid_depth_promoted_symbols={len(self._paid_depth_symbols)}",
                 *result.notes,
             ]
             if new_symbols and self.client.status().connected:
-                self.client.subscribe(new_symbols, levels)
+                self.client.subscribe(
+                    new_symbols,
+                    discovery_subscription_levels(self.config),
+                )
+            if newly_promoted and self.client.status().connected:
+                self.client.subscribe(
+                    newly_promoted,
+                    promoted_subscription_levels(self.config),
+                )
             return list(self._runtime_symbols)
         except Exception as exc:  # noqa: BLE001 - discovery must not kill runner
             self._last_discovery_errors = [f"runtime_discovery:{type(exc).__name__}"]
             return symbols
 
+    def _promote_paid_depth_symbols(self, discovered_symbols: list[str]) -> list[str]:
+        cfg = self.config.get("paid_depth_promotion", {}) or {}
+        if not cfg.get("enabled", False):
+            return []
+        max_symbols = max(0, int(cfg.get("max_symbols") or 20))
+        if max_symbols == 0 or not promoted_subscription_levels(self.config):
+            return []
+        existing = set(self._paid_depth_symbols)
+        newly_promoted: list[str] = []
+        for symbol in discovered_symbols:
+            if symbol in existing:
+                continue
+            if len(self._paid_depth_symbols) >= max_symbols:
+                break
+            self._paid_depth_symbols.append(symbol)
+            newly_promoted.append(symbol)
+            existing.add(symbol)
+        return newly_promoted
+
     def persist_buffer_outputs(self, symbols: list[str]) -> None:
         events = []
         snapshot_count = 0
         for symbol in symbols:
-            snapshot = self.buffer.latest_snapshot(symbol, received_at=now_iso())
+            metadata = self._symbol_metadata.get(symbol, {})
+            snapshot = self.buffer.latest_snapshot(
+                symbol,
+                name=metadata.get("name", "unknown"),
+                theme=metadata.get("theme", "unknown"),
+                received_at=now_iso(),
+            )
             if snapshot.price <= 0:
                 continue
             self.store.save_signal_snapshot(snapshot)
@@ -476,22 +555,39 @@ class AegisAlphaRunner:
             "SECTOR_ROTATION",
             "MARKET_BOTTOM_REVERSAL",
         }
+        candidate_cfg = self.config.get("candidate_investigation", {}) or {}
+        candidate_enabled = bool(candidate_cfg.get("enabled", True))
+        candidate_min_score = float(candidate_cfg.get("min_score") or 75.0)
         for event in events:
-            if event.event_type not in critical_types:
+            is_candidate_investigation = (
+                candidate_enabled
+                and event.event_type == "SECOND_BOARD_CANDIDATE_REPRICE"
+                and event.score >= candidate_min_score
+            )
+            if event.event_type not in critical_types and not is_candidate_investigation:
+                continue
+            alert_event_id = event.event_id
+            alert_title = f"{event.event_type} {event.symbol}"
+            if is_candidate_investigation:
+                trading_day = (event.received_at or event.provider_timestamp or now_iso())[:10]
+                alert_event_id = f"candidate-investigation:{trading_day}:{event.symbol}"
+                alert_title = f"CANDIDATE_INVESTIGATION {event.symbol}"
+            if alert_event_id and self.store.get_alert_by_event(alert_event_id) is not None:
                 continue
             critical_severity_types = {
                 "SEAL_ORDER_DECAY",
                 "THEME_LEADER_BREAK_BOARD",
                 "MARKET_BOTTOM_REVERSAL",
             }
-            severity = (
-                "critical" if event.event_type in critical_severity_types else "warning"
-            )
+            severity = "critical" if event.event_type in critical_severity_types else "warning"
             alert = alert_store.create(
-                title=f"{event.event_type} {event.symbol}",
-                body="; ".join(event.evidence)[:512],
+                title=alert_title,
+                body=(
+                    f"score={event.score:.2f}; confidence={event.confidence}; "
+                    + "; ".join(event.evidence)
+                )[:512],
                 severity=severity,
-                event_id=event.event_id,
+                event_id=alert_event_id,
                 symbol=event.symbol,
                 theme=event.theme,
             )
@@ -537,13 +633,7 @@ class AegisAlphaRunner:
             except Exception:
                 pass
 
-        # Try to load all second-board candidates once (best-effort)
-        candidates: list = []
-        if self._sector_events_adapter is not None:
-            try:
-                candidates = self._sector_events_adapter.get_second_board_candidates()
-            except Exception:
-                candidates = []
+        candidates = self._reference_candidates_for_buypoints()
 
         fired_signals: list = []
 
@@ -593,10 +683,17 @@ class AegisAlphaRunner:
                 for signal in signals:
                     if signal.state != "buy_point_alert":
                         continue
+                    # Replay uses the full rolling window as state-machine context,
+                    # but live delivery must only surface a signal born on the
+                    # newest completed minute. Older triggers are replay history.
+                    if signal.triggered_at != bars[-1].time:
+                        continue
                     fired_signals.append(signal)
 
                     # Stable dedup key: same symbol + same triggered bar time → no re-alert
                     event_id = f"buypoint:{symbol}:{signal.triggered_at}"
+                    if self.store.get_alert_by_event(event_id) is not None:
+                        continue
                     alert = alert_store.create(
                         title=f"BUYPOINT_ALERT {symbol}",
                         body=("; ".join(signal.evidence)[:480] + f" | previous_high_source={prev_high_source}"),
@@ -613,6 +710,26 @@ class AegisAlphaRunner:
                 pass
 
         return fired_signals
+
+    def _reference_candidates_for_buypoints(self) -> list:
+        """Cache provider candidates used only to resolve previous-high facts."""
+        cfg = self.config.get("buypoint_reference_data", {}) or {}
+        refresh_seconds = max(60, int(cfg.get("refresh_seconds") or 900))
+        current = time.time()
+        if (
+            self._reference_candidates
+            and current - self._reference_candidates_loaded_at < refresh_seconds
+        ):
+            return self._reference_candidates
+        if self._sector_events_adapter is None:
+            return self._reference_candidates
+        try:
+            candidates = self._sector_events_adapter.get_second_board_candidates()
+        except Exception:
+            return self._reference_candidates
+        self._reference_candidates = list(candidates or [])
+        self._reference_candidates_loaded_at = current
+        return self._reference_candidates
 
     def validate_selections_next_day(self) -> list:
         """次日自动对照昨收选股审计 vs 今日盘中触发,写 SELECTION_VALIDATION 告警。
@@ -643,11 +760,13 @@ class AegisAlphaRunner:
         if prior_audit is None:
             return []
         as_of = prior_audit.as_of_day
+        event_id = f"selection_validation:{as_of}:{today}"
+        if self.store.get_alert_by_event(event_id) is not None:
+            return []
         result = get_selection_trigger_validation(as_of, today)
         if not isinstance(result, dict) or result.get("data_mode") != "ok":
             return []
         alert_store = AlertStore(self.store)
-        event_id = f"selection_validation:{as_of}:{today}"
         body = (
             f"昨收({as_of})选股 vs 今日触发: {result.get('triggered_count')}/{result.get('total')} 触发, "
             f"trigger_rate={result.get('trigger_rate')}, equals_baseline={result.get('equals_baseline')}, "
@@ -698,7 +817,14 @@ class AegisAlphaRunner:
 
 def status_payload(config_path: str | None = None) -> dict:
     config = load_runner_config(config_path)
-    status = read_runner_status(config.get("storage", {}).get("status_path"))
+    raw_status_path = config.get("storage", {}).get("status_path")
+    status_path = Path(raw_status_path) if raw_status_path else Path(
+        os.environ.get("AEGIS_ALPHA_RUNNER_STATUS_PATH", "data/runner_status.json")
+    )
+    if not status_path.is_absolute():
+        root = Path(os.environ.get("AEGIS_ALPHA_PROJECT_ROOT", project_root()))
+        status_path = root / status_path
+    status = read_runner_status(status_path)
     return status.model_dump() if status else {
         "state": "STOPPED",
         "updated_at": now_iso(),

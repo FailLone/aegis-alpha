@@ -1,0 +1,54 @@
+model:
+  provider: deepseek
+  default: deepseek-v4-pro
+  base_url: ""
+  api_mode: chat_completions
+providers: {}
+fallback_providers:
+  - provider: openrouter
+    model: openai/gpt-5.4
+toolsets: []
+agent:
+  max_turns: 24
+  gateway_timeout: 600
+  api_max_retries: 1
+  tool_use_enforcement: auto
+terminal:
+  backend: local
+  cwd: "__PROJECT_ROOT__"
+  timeout: 60
+  persistent_shell: false
+compression:
+  enabled: true
+  threshold: 0.5
+  target_ratio: 0.2
+  protect_last_n: 12
+tool_output:
+  max_bytes: 30000
+  max_lines: 1000
+  max_line_length: 2000
+prompt_caching:
+  cache_ttl: 5m
+platforms: {}
+mcp_servers:
+  aegis_alpha:
+    command: "__PROJECT_ROOT__/.venv/bin/python"
+    args:
+      - "__PROJECT_ROOT__/scripts/run_mcp.py"
+    enabled: true
+    supports_parallel_tool_calls: true
+    tools:
+      include:
+        - get_recent_market_events
+        - get_runner_status
+        - get_realtime_symbol_context
+        - get_intraday_theme_context
+        - get_intraday_market_context
+        - get_pending_alerts
+        - acknowledge_alert
+        - record_agent_observation
+        - get_agent_observation
+        - list_agent_observations
+        - notify_agent_observation
+      prompts: false
+      resources: false

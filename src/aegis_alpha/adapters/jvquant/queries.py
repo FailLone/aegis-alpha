@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import Any
 
 from aegis_alpha.cache import TTLCache
+from aegis_alpha.alerts.provider_health import record_provider_failure
 from aegis_alpha.rate_limit import TokenBucket
 
 
@@ -39,6 +40,15 @@ class JvQuantQueryClient:
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(client.query, query, 1, 1, sort_key)
-            payload = future.result(timeout=self.timeout_seconds)
+            try:
+                payload = future.result(timeout=self.timeout_seconds)
+            except Exception as exc:
+                record_provider_failure(
+                    provider="jvQuant",
+                    component="semantic_query",
+                    error=str(exc) or type(exc).__name__,
+                    metadata={"query": query[:160], "sort_key": sort_key},
+                )
+                raise
         self.cache.set(cache_key, payload)
         return payload

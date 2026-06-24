@@ -77,7 +77,7 @@ def test_post_alert_to_hermes_signs_like_hermes_webhook(monkeypatch) -> None:
 
 
 def test_post_alert_to_hermes_is_disabled_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("AEGIS_ALPHA_HERMES_WEBHOOK_ENABLED", raising=False)
+    monkeypatch.setenv("AEGIS_ALPHA_HERMES_WEBHOOK_ENABLED", "false")
 
     called = False
 

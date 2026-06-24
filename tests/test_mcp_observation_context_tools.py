@@ -84,6 +84,30 @@ def test_symbol_context_stale_only(monkeypatch, tmp_path):
     assert res["freshness"] == "all_stale"
 
 
+def test_symbol_context_compacts_and_caps_repeated_events(monkeypatch, tmp_path):
+    store = _store(monkeypatch, tmp_path)
+    store.save_signal_snapshot(_snapshot("002491"))
+    store.save_market_events([
+        MarketEvent(
+            event_id=f"e{i}",
+            event_type="SECOND_BOARD_CANDIDATE_REPRICE",
+            symbol="002491",
+            theme="AI算力",
+            score=float(i),
+            evidence=["price", "speed"],
+            data={"large": "payload"},
+            received_at=f"2026-06-23T09:40:{i:02d}+08:00",
+            freshness_status="fresh",
+        )
+        for i in range(10)
+    ])
+
+    res = server.get_realtime_symbol_context("002491")
+
+    assert res["recent_event_count"] == 8
+    assert all("data" not in event for event in res["recent_events"])
+
+
 # --- get_intraday_theme_context ---
 
 def test_theme_context_with_theme_name(monkeypatch, tmp_path):

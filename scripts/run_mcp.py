@@ -12,6 +12,9 @@ if str(SRC) not in sys.path:
 
 os.environ.setdefault("AEGIS_ALPHA_PROJECT_ROOT", str(ROOT))
 os.environ.setdefault("AEGIS_ALPHA_ENV_FILE", str(ROOT / ".env.local"))
+os.environ.setdefault("AEGIS_ALPHA_DATA_DIR", str(ROOT / "data"))
+os.environ.setdefault("AEGIS_ALPHA_DB_PATH", str(ROOT / "data" / "aegis_alpha.db"))
+os.environ.setdefault("AEGIS_ALPHA_RUNNER_STATUS_PATH", str(ROOT / "data" / "runner_status.json"))
 
 from aegis_alpha.config import load_project_env
 

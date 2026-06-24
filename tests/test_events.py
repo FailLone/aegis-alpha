@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -304,6 +306,48 @@ def test_jvquant_log_connection_lost_marks_disconnected() -> None:
     status = client.status()
     assert status.connected is False
     assert status.last_error == "provider_connection_lost"
+
+
+def test_jvquant_disconnect_discards_dead_transport_for_reconnect() -> None:
+    from aegis_alpha.adapters.jvquant_websocket import JvQuantRealtimeClient
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.disconnected = False
+
+        def disconnect(self) -> None:
+            self.disconnected = True
+
+    transport = FakeTransport()
+    client = JvQuantRealtimeClient()
+    client._client = transport
+    client._connected = True
+    client._subscribed.add("lv1_600000")
+    client._last_message_at = "2026-06-24T11:30:00+08:00"
+
+    status = client.disconnect()
+
+    assert transport.disconnected is True
+    assert client._client is None
+    assert status.connected is False
+    assert status.subscribed == []
+    assert status.last_message_at == ""
+
+
+def test_jvquant_quota_log_preserves_error_and_records_failure(tmp_path, monkeypatch) -> None:
+    from aegis_alpha.adapters.jvquant_websocket import JvQuantRealtimeClient
+
+    monkeypatch.setenv(
+        "AEGIS_ALPHA_PROVIDER_HEALTH_EVENT_PATH",
+        str(tmp_path / "provider-health.jsonl"),
+    )
+    client = JvQuantRealtimeClient()
+    client._on_log("当前账户积分不足 60000，无法调用 level_queue")
+
+    status = client.status()
+    assert "积分不足" in status.last_error
+    payload = json.loads((tmp_path / "provider-health.jsonl").read_text().strip())
+    assert payload["category"] == "balance_or_quota"
 
 
 def test_sqlite_store_roundtrip(tmp_path) -> None:

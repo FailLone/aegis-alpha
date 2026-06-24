@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from aegis_alpha.adapters.mock_market_data import MockMarketDataAdapter
+from aegis_alpha.alerts.provider_health import record_provider_failure
 from aegis_alpha.adapters.jvquant import parsers as P
 from aegis_alpha.adapters.jvquant import historical_second_board as HSB
 from aegis_alpha.adapters.jvquant.parsers import float_or_zero as _float_or_zero
@@ -126,6 +127,11 @@ class JvQuantMarketDataAdapter:
     def __init__(self, token: str | None = None) -> None:
         self.token = token or os.environ.get("JVQUANT_TOKEN", "")
         if not self.token:
+            record_provider_failure(
+                provider="jvQuant",
+                component="semantic_client",
+                error="JVQUANT_TOKEN missing",
+            )
             raise ValueError("JVQUANT_TOKEN missing")
         self._fallback = MockMarketDataAdapter()
         self._client: Any | None = None
@@ -149,9 +155,17 @@ class JvQuantMarketDataAdapter:
     @property
     def client(self) -> Any:
         if self._client is None:
-            from jvQuant import sql_client
+            try:
+                from jvQuant import sql_client
 
-            self._client = sql_client.Construct(token=self.token, log_level=logging.ERROR)
+                self._client = sql_client.Construct(token=self.token, log_level=logging.ERROR)
+            except Exception as exc:
+                record_provider_failure(
+                    provider="jvQuant",
+                    component="semantic_client",
+                    error=str(exc) or type(exc).__name__,
+                )
+                raise
         return self._client
 
     def get_market_snapshot(self) -> MarketSnapshot:

@@ -286,8 +286,10 @@ Use `get_runner_status` when the user asks whether realtime monitoring is active
     - 历史样本验证：当用户要求“验证可用性”“跑一段历史样本”“看看触发器命中率/误报”时，调用 `run_historical_trigger_validation(end_day, lookback_days, limit, window_start, window_end)`。必须区分 replay 触发事实和 post-trigger outcome；后者只能用于校准。
 
 23. Agent 市场观察 / 盘中 observer：
+    - 每轮先调用 `get_pending_alerts(limit=50)`。`BUYPOINT_ALERT` 必须优先调查；`CANDIDATE_INVESTIGATION` 表示某只股票已达到高置信强势候选阈值，即使没有完整买点，也必须逐只调用 `get_realtime_symbol_context` 调查，不能只依赖 `strongest_events` TopN。
     - 当 Hermes webhook 收到 runner alert，或 cron 触发周期性 observer 时，先调用 `get_intraday_market_context(lookback_minutes=30)`。若有具体 symbol，再调用 `get_realtime_symbol_context(symbol, lookback_minutes=30)`；若能识别 theme，再调用 `get_intraday_theme_context(theme_or_symbol, lookback_minutes=30)`。
     - 你可以输出零条观察。只有当事实显示 strategy-adjacent 信息时，才调用 `record_agent_observation`。常见类型包括 `buy_point_quality`、`theme_rotation`、`market_regime_shift`、`strong_continuation_without_buy_point`、`watchlist_observation`、`data_gap`、`noise_or_rejected_trigger`。
+    - webhook alert 增强必须使用 `source="trigger_enrichment"` 并填写 `linked_alert_ids_json`；cron 周期观察必须使用 `source="periodic_market_scan"`。不要自行创造 source 枚举值。
     - `stance` 只允许表达研究观察态度：`actionable_watch` / `monitor_only` / `insufficient_data` / `reject`。不要把 `actionable_watch` 写成买入建议；它只表示值得中断提醒的人类观察项。
     - `evidence_json`、`counter_evidence_json`、`data_gaps_json` 必须是 JSON 数组字符串。至少写一条证据和一条数据缺口；若你认为无缺口，也写明 `["未发现新增数据缺口"]`，避免不可审计的空观察。
     - 不要自填或口头承诺 notification grade。`record_agent_observation` 返回的 `notification_grade` 才是 WeClaw 推送门控依据。若 grade 为 `urgent` 或 `important`，调用 `notify_agent_observation`；若返回 `posted=false`，只汇报原因，不重试刷屏。

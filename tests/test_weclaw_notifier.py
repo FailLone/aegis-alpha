@@ -24,7 +24,8 @@ def _alert(title: str = "BUYPOINT_ALERT 600000") -> AgentAlert:
     )
 
 
-def test_weclaw_notification_disabled_by_default() -> None:
+def test_weclaw_notification_disabled_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("AEGIS_ALPHA_WECLAW_ENABLED", "false")
     assert should_post_alert_to_weclaw(_alert(), {}) is False
 
 

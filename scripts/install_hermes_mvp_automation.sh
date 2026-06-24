@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HERMES_SCRIPTS_DIR="${HERMES_SCRIPTS_DIR:-$HOME/.hermes/scripts}"
 HERMES_ENV_FILE="${HERMES_ENV_FILE:-$HOME/.hermes/.env}"
+OBSERVER_PROFILE="${OBSERVER_PROFILE:-aegisobserver}"
 PROJECT_ENV_FILE="${PROJECT_ENV_FILE:-$PROJECT_ROOT/.env.local}"
 WEBHOOK_PORT="${WEBHOOK_PORT:-8644}"
 WEBHOOK_ROUTE="${WEBHOOK_ROUTE:-aegis-alpha-alerts}"
@@ -32,6 +33,7 @@ Options:
 Environment:
   HERMES_SCRIPTS_DIR  Defaults to ~/.hermes/scripts.
   HERMES_ENV_FILE     Defaults to ~/.hermes/.env.
+  OBSERVER_PROFILE    Defaults to aegisobserver.
   PROJECT_ENV_FILE    Defaults to <repo>/.env.local.
   WEBHOOK_PORT        Defaults to 8644.
   WEBHOOK_ROUTE       Defaults to aegis-alpha-alerts.
@@ -131,6 +133,26 @@ remove_existing_cron_jobs_by_name() {
   done
 }
 
+set_cron_job_profile() {
+  local job_id="$1"
+  local profile="$2"
+  local hermes_agent_root="${HERMES_AGENT_ROOT:-$HOME/.hermes/hermes-agent}"
+  HERMES_HOME="$HOME/.hermes" "$hermes_agent_root/venv/bin/python" - \
+    "$hermes_agent_root" "$job_id" "$profile" <<'PY'
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from tools.cronjob_tools import cronjob
+
+result = json.loads(
+    cronjob(action="update", job_id=sys.argv[2], skills=[], profile=sys.argv[3])
+)
+if not result.get("success"):
+    raise SystemExit(result.get("error") or "failed to set cron profile")
+PY
+}
+
 mkdir -p "$HERMES_SCRIPTS_DIR"
 
 if [[ "$CONFIGURE_MODEL" == "true" ]]; then
@@ -194,16 +216,46 @@ print(json.dumps({
 PY
 EOF
 
+cat > "$HERMES_SCRIPTS_DIR/aegis_alpha_provider_health_watch.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$PROJECT_ROOT"
+PYTHONPATH=src .venv/bin/python scripts/provider_health_watch.py
+EOF
+
 chmod +x "$HERMES_SCRIPTS_DIR/aegis_alpha_mvp_prepare_context.sh"
 chmod +x "$HERMES_SCRIPTS_DIR/aegis_alpha_mvp_report_context.sh"
 chmod +x "$HERMES_SCRIPTS_DIR/aegis_alpha_mvp_export_subscription.sh"
 chmod +x "$HERMES_SCRIPTS_DIR/aegis_alpha_market_observer_context.sh"
+chmod +x "$HERMES_SCRIPTS_DIR/aegis_alpha_provider_health_watch.sh"
+
+if ! hermes profile show "$OBSERVER_PROFILE" >/dev/null 2>&1; then
+  hermes profile create "$OBSERVER_PROFILE" --clone \
+    --description "Lightweight Aegis Alpha intraday market observer with a narrow MCP tool surface."
+fi
+OBSERVER_PROFILE_DIR="$HOME/.hermes/profiles/$OBSERVER_PROFILE"
+mkdir -p "$OBSERVER_PROFILE_DIR"
+sed "s|__PROJECT_ROOT__|$PROJECT_ROOT|g" \
+  "$PROJECT_ROOT/.hermes/config/aegis-observer-profile.yaml" \
+  > "$OBSERVER_PROFILE_DIR/config.yaml"
+mkdir -p "$OBSERVER_PROFILE_DIR/scripts"
+for script_name in \
+  aegis_alpha_mvp_prepare_context.sh \
+  aegis_alpha_mvp_report_context.sh \
+  aegis_alpha_mvp_export_subscription.sh \
+  aegis_alpha_market_observer_context.sh \
+  aegis_alpha_provider_health_watch.sh
+do
+  cp "$HERMES_SCRIPTS_DIR/$script_name" "$OBSERVER_PROFILE_DIR/scripts/$script_name"
+  chmod +x "$OBSERVER_PROFILE_DIR/scripts/$script_name"
+done
 
 echo "Installed Hermes context scripts:"
 echo "  $HERMES_SCRIPTS_DIR/aegis_alpha_mvp_prepare_context.sh"
 echo "  $HERMES_SCRIPTS_DIR/aegis_alpha_mvp_report_context.sh"
 echo "  $HERMES_SCRIPTS_DIR/aegis_alpha_mvp_export_subscription.sh"
 echo "  $HERMES_SCRIPTS_DIR/aegis_alpha_market_observer_context.sh"
+echo "  $HERMES_SCRIPTS_DIR/aegis_alpha_provider_health_watch.sh"
 
 if [[ "$INSTALL_GATEWAY" == "true" ]]; then
   update_env_key "$HERMES_ENV_FILE" WEBHOOK_ENABLED true
@@ -228,7 +280,7 @@ if [[ "$CREATE_JOBS" == "true" ]]; then
 
   hermes webhook remove "$WEBHOOK_ROUTE" >/dev/null 2>&1 || true
   hermes webhook subscribe "$WEBHOOK_ROUTE" \
-    --events "aegis.buy_point_alert,aegis.selection_validation,aegis.seal_order_decay,aegis.big_order_inflow_spike,aegis.theme_divergence,aegis.theme_leader_break_board,aegis.sector_rotation,aegis.market_bottom_reversal" \
+    --events "aegis.buy_point_alert,aegis.candidate_investigation,aegis.selection_validation,aegis.seal_order_decay,aegis.big_order_inflow_spike,aegis.theme_divergence,aegis.theme_leader_break_board,aegis.sector_rotation,aegis.market_bottom_reversal" \
     --skills "second-board-radar" \
     --deliver "log" \
     --secret "$WEBHOOK_SECRET_VALUE" \
@@ -241,12 +293,13 @@ body={summary.body}
 event_id={summary.event_id}
 
 请使用 second-board-radar skill 的 Agent 市场观察流程处理该 alert：
-1. 调用 get_intraday_market_context(lookback_minutes=30)；
-2. 如果 symbol 非空，调用 get_realtime_symbol_context(symbol, lookback_minutes=30)；
-3. 如果 theme 或 symbol 可用，调用 get_intraday_theme_context(theme_or_symbol, lookback_minutes=30)；
-4. 判断它是 buy_point_quality、theme_rotation、market_regime_shift、strong_continuation_without_buy_point、watchlist_observation、data_gap 还是 noise_or_rejected_trigger；
-5. 只有事实足够时调用 record_agent_observation，必须写 evidence/counter_evidence/data_gaps，且不输出买卖指令；
-6. 如果 record_agent_observation 返回 notification_grade=urgent 或 important，调用 notify_agent_observation(observation_id)。
+1. 调用 get_pending_alerts(limit=50)，按 event_id 找到当前告警的真实 alert_id；
+2. 调用 get_intraday_market_context(lookback_minutes=30)；
+3. 如果 symbol 非空，调用 get_realtime_symbol_context(symbol, lookback_minutes=30)；
+4. 如果 theme 或 symbol 可用，调用 get_intraday_theme_context(theme_or_symbol, lookback_minutes=30)；
+5. 判断它是 buy_point_quality、theme_rotation、market_regime_shift、strong_continuation_without_buy_point、watchlist_observation、data_gap 还是 noise_or_rejected_trigger。CANDIDATE_INVESTIGATION 若存在同题材联动或强势延续事实，应使用 strong_continuation_without_buy_point；只有事实支持持续跟踪时使用 stance=actionable_watch；
+6. 只有事实足够时调用 record_agent_observation，source 必须使用 trigger_enrichment，并把真实 alert_id 写入 linked_alert_ids_json；必须写 evidence/counter_evidence/data_gaps，且不输出买卖指令；
+7. 处理完成后调用 acknowledge_alert(alert_id, note=...)。如果 record_agent_observation 返回 notification_grade=urgent 或 important，调用 notify_agent_observation(observation_id)。
 最后用中文输出 observation_id、notification_grade、是否推送、核心依据和缺口。"
 
   remove_existing_cron_jobs_by_name "aegis-alpha-daily-prepare"
@@ -266,7 +319,7 @@ event_id={summary.event_id}
     --skill "second-board-radar" \
     --script "aegis_alpha_mvp_report_context.sh" \
     --deliver "local" \
-    "5 10 * * 1-5" \
+    "30 10 * * 1-5" \
     "根据脚本输出的 hermes_cron_context，读取最新 selection audit、runner alerts、runner subscribed symbols、get_selection_trigger_validation，并解释今天早盘是否触发主策略。说明 Top3 审计结果和更大 scan pool alert 是两层；区分主策略触发、强势延续未触发、二板接力路径和未启动；不要输出买卖指令。"
 
   remove_existing_cron_jobs_by_name "aegis-alpha-export-subscription"
@@ -279,13 +332,23 @@ event_id={summary.event_id}
     "20 16 * * 1-5" \
     "Export latest Aegis Alpha scan-pool subscription and restart runner."
 
+  remove_existing_cron_jobs_by_name "aegis-alpha-provider-health"
+  hermes cron create \
+    --name "aegis-alpha-provider-health" \
+    --workdir "$PROJECT_ROOT" \
+    --script "aegis_alpha_provider_health_watch.sh" \
+    --no-agent \
+    --deliver "local" \
+    "*/5 * * * *" \
+    "Check Agent and market-data provider balance, quota, entitlement, and rate-limit failures."
+
   read -r -d '' OBSERVER_PROMPT <<'PROMPT' || true
-根据脚本输出的 hermes_cron_context 与 market_context_snapshot，执行 second-board-radar skill 的 Agent 市场观察流程：
-1. 先检查 runner_state/freshness/data_gaps；如果 runner 未运行或数据不足，可以输出零观察，或记录 data_gap/insufficient_data。
-2. 对 strongest_events、approaching_limit_up、BIG_ORDER_INFLOW_SPIKE、SEAL_ORDER_DECAY、theme/sector 相关事件做策略相关性判断。
-3. 对值得调查的 symbol 调用 get_realtime_symbol_context(symbol, lookback_minutes=30)；对 theme 调用 get_intraday_theme_context(theme_or_symbol, lookback_minutes=30)。
-4. 如果发现买点质量、题材轮动、市场状态变化、强势延续但未触发买点、或重要数据缺口，调用 record_agent_observation。必须区分 evidence、counter_evidence、data_gaps，不得写买入/卖出/仓位指令。
-5. 若返回 notification_grade 为 urgent 或 important，调用 notify_agent_observation(observation_id)。
+根据脚本输出的 hermes_cron_context 与 market_context_snapshot，执行轻量 Agent 市场观察流程：
+1. 先调用 get_pending_alerts(limit=50)。BUYPOINT_ALERT 优先调查；CANDIDATE_INVESTIGATION 表示高置信强势候选，即使没有标准买点也必须逐只调查，不能被 strongest_events TopN 挤掉。
+2. 检查 runner_state/freshness/data_gaps；如果 runner 未运行或数据不足，可以记录 data_gap/insufficient_data。
+3. 对每个待调查 symbol 调用 get_realtime_symbol_context(symbol, lookback_minutes=30)；对已识别 theme 调用 get_intraday_theme_context(theme_or_symbol, lookback_minutes=30)。同时检查 strongest_events、APPROACHING_LIMIT_UP、BIG_ORDER_INFLOW_SPIKE、SEAL_ORDER_DECAY 和板块事件。
+4. 如果发现买点质量、题材轮动、市场状态变化、强势延续但未触发买点、或重要数据缺口，调用 record_agent_observation，source 必须使用 periodic_market_scan。高置信强势但没有完整买点时，使用 observation_type=strong_continuation_without_buy_point；只有事实支持值得持续跟踪时才使用 stance=actionable_watch。
+5. 处理完待办后调用 acknowledge_alert(alert_id, note=...)。若 observation 的 notification_grade 为 urgent 或 important，调用 notify_agent_observation(observation_id)。
 6. 输出 concise 中文摘要：本轮是否有观察、observation_id、notification_grade、是否推送 WeClaw、主要依据、主要缺口。不要为了凑数强行产出观察。
 PROMPT
 
@@ -301,14 +364,22 @@ PROMPT
     name="${spec%%|*}"
     schedule="${spec#*|}"
     remove_existing_cron_jobs_by_name "$name"
-    hermes cron create \
+    create_output="$(hermes cron create \
       --name "$name" \
       --workdir "$PROJECT_ROOT" \
-      --skill "second-board-radar" \
       --script "aegis_alpha_market_observer_context.sh" \
       --deliver "local" \
       "$schedule" \
-      "$OBSERVER_PROMPT"
+      "$OBSERVER_PROMPT")"
+    echo "$create_output"
+    observer_job_id="$(printf '%s\n' "$create_output" | awk '/Created job:/ {print $3; exit}')"
+    if [[ -z "$observer_job_id" ]]; then
+      echo "Unable to determine observer cron job id for $name" >&2
+      exit 1
+    fi
+    # Hermes CLI pre-parses --profile as a process profile override. Update the
+    # root scheduler job through Hermes' own cron API so it stores a per-job profile.
+    set_cron_job_profile "$observer_job_id" "$OBSERVER_PROFILE"
   done
 
   echo "Hermes cron jobs and webhook subscription created."

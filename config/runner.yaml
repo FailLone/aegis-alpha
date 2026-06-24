@@ -38,9 +38,31 @@ realtime_discovery:
   enabled: true
   interval_seconds: 300
   max_symbols: 200
+  # Broad discovery is coverage-only. Paid depth is reserved for the prepared
+  # strategy pool in JVQUANT_SUBSCRIBE_SYMBOLS.
+  subscription_levels:
+    - lv1
   seed_turnover_yi: 30
   include_current_large_turnover: true
   include_current_limitup: true
+
+paid_depth_promotion:
+  enabled: true
+  # Discovery order is provider turnover order followed by the limit-up pool.
+  # Keep expensive depth bounded while still enriching the strongest live names.
+  max_symbols: 20
+  levels:
+    - lv2
+    - lv10
+
+candidate_investigation:
+  enabled: true
+  min_score: 75
+
+buypoint_reference_data:
+  # Previous-high facts do not need a provider database round-trip every
+  # 15-second runner cycle.
+  refresh_seconds: 900
 
 storage:
   status_path: data/runner_status.json
@@ -56,7 +78,7 @@ selection_validation:
   after: "10:00"
 
 hermes_webhook:
-  enabled: false
+  enabled: true
   url_env: HERMES_AEGIS_WEBHOOK_URL
   secret_env: HERMES_AEGIS_WEBHOOK_SECRET
   timeout_seconds: 3
@@ -67,10 +89,17 @@ weclaw_notification:
   target_env: AEGIS_ALPHA_WECLAW_TO
   timeout_seconds: 3
   allowed_title_prefixes:
-    - BUYPOINT_ALERT
     - SELECTION_VALIDATION
+  # BUYPOINT_ALERT is sent to Hermes for agent investigation. WeClaw receives
+  # only agent-graded observations, avoiding raw trigger floods.
   # AgentObservation 推送门控:notification_grade 由确定性策略计算,
   # 默认只推 urgent + important。agent 不自填等级。
   observation_grades:
     - urgent
     - important
+
+provider_health_notification:
+  enabled: true
+  cooldown_hours: 6
+  # Billing/quota/auth failures bypass market-signal grading and notify the
+  # operator directly through WeClaw.

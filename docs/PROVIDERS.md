@@ -89,7 +89,7 @@ Recommended default:
 ```yaml
 model:
   provider: "openrouter"
-  default: "anthropic/claude-opus-4.7"
+  default: "openai/gpt-5.4"
   base_url: "https://openrouter.ai/api/v1"
   api_mode: "chat_completions"
 ```

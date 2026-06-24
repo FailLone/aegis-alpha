@@ -119,6 +119,51 @@ def post_alert_to_weclaw(alert: AgentAlert, config: dict[str, Any]) -> bool:
         return False
 
 
+def post_system_message_to_weclaw(text: str, config: dict[str, Any] | None = None) -> bool:
+    """Send an operational message without market-signal filtering.
+
+    Billing, quota, authentication, and provider-health failures must not depend
+    on an agent or an observation grade to reach the operator.
+    """
+    resolved_config = config or {}
+    if not weclaw_notification_enabled(resolved_config):
+        return False
+
+    url = weclaw_api_url(resolved_config)
+    target = weclaw_target(resolved_config)
+    if not url or not target or not text.strip():
+        _LOGGER.warning("event=weclaw_system_notify_skip reason=missing_url_target_or_text")
+        return False
+
+    body = json.dumps(
+        {"to": target, "text": text.strip()},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=weclaw_timeout(resolved_config)) as response:
+            return 200 <= response.status < 300
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:200]
+        _LOGGER.warning(
+            "event=weclaw_system_notify_failed status=%s body=%s",
+            exc.code,
+            detail,
+        )
+        return False
+    except Exception as exc:
+        _LOGGER.warning(
+            "event=weclaw_system_notify_failed error=%s",
+            type(exc).__name__,
+        )
+        return False
+
+
 def allowed_observation_grades(config: dict[str, Any]) -> tuple[str, ...]:
     cfg = config.get("weclaw_notification", {}) or {}
     raw = cfg.get("observation_grades")
